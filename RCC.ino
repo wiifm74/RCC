@@ -1,8 +1,11 @@
 /*-----( Feature Definitions )-----*/
-const int CONFIG_VERSION = 1;
+const int CONFIG_VERSION = 2;
 
+#include <EEPROMex.h>			// https://github.com/thijse/Arduino-EEPROMEx
 #include <Wire.h>                       // Included in Arduino
 #include <PV_RTD_RS232_RS485_Shield.h>  // http://prods.protovoltaics.com/rtd-rs232-rs485/lib/PV_RTD_RS232_RS485_Shield.zip
+#include <Adafruit_Sensor.h>            // https://github.com/adafruit/Adafruit_Sensor
+#include <Adafruit_BMP085_U.h>          // https://github.com/adafruit/Adafruit-BMP085-Library
 #include <TToABV.h>			// https://github.com/VisionStills/TemperatureToABV
 #include <PID_v1.h>
 #include <TwoWayMotorisedBallValve.h>
@@ -27,7 +30,7 @@ const int CONFIG_VERSION = 1;
 #define LCD_BUFFER_SIZE 5
 #define DISPLAY_DECIMALS 2
 
-#define READ_TEMPERATURE_SENSORS_EVERY 250
+#define READ_TEMPERATURE_SENSORS_EVERY 400
 #define COMPUTE_PID_EVERY 250
 #define READ_PRESSURE_SENSORS_EVERY 300000
 #define READ_USER_INPUT_EVERY 20
@@ -38,13 +41,18 @@ volatile bool TwoWayMotorisedBallValve::closeLimitReached;
 uint8_t TwoWayMotorisedBallValve::openLimitPin;
 uint8_t TwoWayMotorisedBallValve::closeLimitPin;
 
+
+/*-----( Declare constants )-----*/
+const float defaultPressure = 1013.25;
+const int memoryBase = 32;
+int configAddress;
+
 // RTD Variables
 int rtdChannel;       		// Channel value for RTD shield
 
 // PID Variables
-double PIDSetpoint;
+//double PIDSetpoint;
 double PIDInput;
-double Kp = 20, Ki = 5, Kd = 1;
 
 // Valve Variables
 double ValveSetPoint = 0;
@@ -65,6 +73,7 @@ boolean newData = false;
 
 // Timing Variables
 unsigned long lastTemperatureRead = 0;
+unsigned long lastPressureRead = 0;
 unsigned long lastDisplayWrite = 0;
 
 typedef char SensorName[36];
@@ -79,6 +88,10 @@ struct Settings {
   int version;
   int sensorsUsed;
   TemperatureSensor sensors[MAXIMUM_TEMPERATURE_SENSORS];
+  double PIDSetPoint;
+  double Kp;
+  double Ki;
+  double Kd;
 } settings = {
   // Place default values for settings here
   CONFIG_VERSION,
@@ -87,28 +100,36 @@ struct Settings {
       1,
       "Column", VAPOR
     }
-  }
+  },
+  92.00,
+  60,
+  30,
+  20
 };
 
 //Objects
 TemperatureSensor temperatureSensors[MAXIMUM_TEMPERATURE_SENSORS];
 PV_RTD_RS232_RS485 rtds(0x52, 100.0);	// RTD shield with PT-100 sensors
-PID myPID(&PIDInput, &ValveSetPoint, &PIDSetpoint, Kp, Ki, Kd, REVERSE);
+Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085); // BMP180 pressure sensor
+PID myPID(&PIDInput, &ValveSetPoint, &settings.PIDSetPoint, settings.Kp, settings.Ki, settings.Kd, DIRECT);
 TwoWayMotorisedBallValve valve;
 LiquidCrystal_I2C	lcd(0x27, 2, 1, 0, 4, 5, 6, 7); // 0x27 is the I2C bus address for an unmodified module
 
 void setup()
 {
   Serial.begin(9600);
+  // Initialise settings
+  initSettings();
   // Initialise LCD Display
   init_display();
   // Initialise temperature sensors
   init_temperature_sensors();
   // Initialise Two Way Motorised Ball Valve
+  // Initialise pressure sensor
+  initPressureSensors();
   valve.begin(&ValveSetPoint, OPEN_VALVE_PIN, CLOSE_VALVE_PIN, MOTOR_SPEED_PIN, OPEN_LIMIT_PIN, CLOSE_LIMIT_PIN);
   // Initialise PID
   init_PID();
-  
 
 }
 
@@ -127,10 +148,37 @@ void loop()
 {
 
   doFunctionAtInterval(read_temperature_sensors, &lastTemperatureRead, READ_TEMPERATURE_SENSORS_EVERY);
+  //doFunctionAtInterval(readPressureSensors, &lastPressureRead, READ_PRESSURE_SENSORS_EVERY);  	// read pressure sensors
   myPID.Compute();
   valve.update();
   doFunctionAtInterval(display_actual, &lastDisplayWrite, WRITE_DISPLAY_EVERY);
   readUserInput();
+}
+
+void initSettings() {
+
+  Settings tempSettings;
+  int timeItTook = 0;
+
+  EEPROM.setMemPool(memoryBase, EEPROMSizeMega);
+  configAddress = EEPROM.getAddress(sizeof(Settings));
+
+  // Read EEPROM settings to temporary location to compare CONFIG_VERSION
+  timeItTook = EEPROM.readBlock(configAddress, tempSettings);
+  // Update EEPROM from new settings configuration if necessary
+  if (tempSettings.version != CONFIG_VERSION) {
+    // Settings have not been saved before or settings configuration has changed
+    timeItTook = EEPROM.writeBlock(configAddress, settings);
+  }
+  // Read settings from EEPROM
+  timeItTook = EEPROM.readBlock(configAddress, settings);
+
+}
+
+void updateSettings() {
+
+  EEPROM.updateBlock(configAddress, settings);
+
 }
 
 void init_temperature_sensors() {
@@ -177,10 +225,11 @@ void init_PID() {
 
   //initialize the variables we're linked to
   PIDInput = 0;
-  PIDSetpoint = 20;
 
   myPID.SetSampleTime(COMPUTE_PID_EVERY);
+  Serial.print("Setting PID max value to "); Serial.println(valve.getCycleTime());
   myPID.SetOutputLimits(0, valve.getCycleTime());
+  myPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
   //turn the PID on
   myPID.SetMode(AUTOMATIC);
 
@@ -198,6 +247,37 @@ void init_display() {
 
 }
 
+void initPressureSensors() {
+
+  // Set pressure for each temperature sensor to default pressure
+  for (int i = 0; i < MAXIMUM_TEMPERATURE_SENSORS; i++) {
+    temperatureSensors[i].tToABV.Pressure(defaultPressure);
+  }
+
+
+  if (!bmp.begin()) {
+    // There was a problem detecting the BMP180 ... check your connections
+    Serial.println("No BMP180 detected ... Check your wiring or I2C ADDR!");
+  } else {
+    readPressureSensors();
+  }
+
+}
+
+void readPressureSensors() {
+
+  sensors_event_t event;
+
+  bmp.getEvent(&event);
+  if (event.pressure) {
+    for (int i = 0; i < MAXIMUM_TEMPERATURE_SENSORS; i++) {
+      temperatureSensors[i].tToABV.Pressure(event.pressure);
+    }
+  }
+
+}
+
+
 void read_temperature_sensors() {
 
   double previousPIDInput = PIDInput;
@@ -206,9 +286,12 @@ void read_temperature_sensors() {
   for (int i = 0; i < settings.sensorsUsed; i++) {
     temperatureSensors[i].tToABV.Temperature(rtds.Get_RTD_Temperature_degC(RTD_SENSOR_WIRES, temperatureSensors[i].rtdChannel));
   }
-
-  //PIDInput = double(temperatureSensors[0].tToABV.ABV());
-  PIDInput = double(temperatureSensors[0].tToABV.Temperature());
+  //if (double(temperatureSensors[0].tToABV.ABV()) < 0) {
+  //  PIDInput = 96;
+  //} else {
+    PIDInput = double(temperatureSensors[0].tToABV.ABV());
+  //}
+  //PIDInput = double(temperatureSensors[0].tToABV.Temperature());
   if (previousPIDInput != PIDInput) {
     actualChanged = true;
   }
@@ -219,7 +302,7 @@ void display_target() {
 
   if (targetChanged) {
     lcd.setCursor(0, 0);
-    dtostrf(PIDSetpoint, LCD_BUFFER_SIZE, DISPLAY_DECIMALS, lcd_buffer);
+    dtostrf(settings.PIDSetPoint, LCD_BUFFER_SIZE, DISPLAY_DECIMALS, lcd_buffer);
     lcd.print("TARGET:");
     lcd.print(lcd_buffer);
     targetChanged = false;
@@ -235,6 +318,7 @@ void display_actual() {
     lcd.print("ACTUAL:");
     lcd.print(lcd_buffer);
     actualChanged = false;
+    Serial.println(lcd_buffer);
   }
 
 }
@@ -285,7 +369,8 @@ void parseUserInput() {
   if (String(messageFromPC) == "TARGET") {
     strtokIndx = strtok(NULL, ",");	// this continues where the previous call left off
     doubleFromPC = atof(strtokIndx);
-    PIDSetpoint = double(doubleFromPC);
+    settings.PIDSetPoint = double(doubleFromPC);
+    updateSettings();
     Serial.print ("Changing target to "); Serial.println(doubleFromPC, 2);
     targetChanged = true;
     display_target();
@@ -293,19 +378,25 @@ void parseUserInput() {
   else if (String(messageFromPC) == "KP") {
     strtokIndx = strtok(NULL, ",");	// this continues where the previous call left off
     doubleFromPC = atof(strtokIndx);
-    myPID.SetTunings(doubleFromPC, Ki, Kd);
+    settings.Kp = doubleFromPC;
+    updateSettings();
+    myPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     Serial.print ("Changing Kp to "); Serial.println(doubleFromPC, 2);
   }
   else if (String(messageFromPC) == "KI") {
     strtokIndx = strtok(NULL, ",");	// this continues where the previous call left off
     doubleFromPC = atof(strtokIndx);
-    myPID.SetTunings(Kp, doubleFromPC, Kd);
+    settings.Ki = doubleFromPC;
+    updateSettings();
+    myPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     Serial.print ("Changing Ki to "); Serial.println(doubleFromPC, 2);
   }
   else if (String(messageFromPC) == "KD") {
     strtokIndx = strtok(NULL, ",");	// this continues where the previous call left off
     doubleFromPC = atof(strtokIndx);
-    myPID.SetTunings(Kp, Ki, doubleFromPC);
+    settings.Kd = doubleFromPC;
+    updateSettings();
+    myPID.SetTunings(settings.Kp, settings.Ki, settings.Kd);
     Serial.print ("Changing Kd to "); Serial.println(doubleFromPC, 2);
   }
   else Serial.println ("Command not recognised.");
